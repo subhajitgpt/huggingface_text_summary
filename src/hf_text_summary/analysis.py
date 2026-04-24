@@ -7,7 +7,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple, Dict, Any, Literal
 import re
 
 import yake
-from transformers import pipeline
+
 
 
 DEFAULT_SUMMARY_MODEL = "sshleifer/distilbart-cnn-12-6"
@@ -25,10 +25,163 @@ class IntentPrediction:
 @dataclass(frozen=True)
 class AnalysisResult:
     summary: str
+    summary_points: List[str]
     key_phrases: List[str]
     intent_top: Optional[IntentPrediction]
     intent_top_k: List[IntentPrediction]
     meta: Dict[str, Any]
+
+
+def choose_summary_point_count(
+    text: str,
+    *,
+    min_points: int = 5,
+    max_points: int = 10,
+) -> int:
+    """Choose how many summary points to display.
+
+    Heuristic: scale from min_points to max_points as the input gets longer.
+    """
+
+    min_points = int(min_points)
+    max_points = int(max_points)
+    if min_points < 1:
+        min_points = 1
+    if max_points < min_points:
+        max_points = min_points
+
+    words = len(re.findall(r"[A-Za-z0-9']+", text or ""))
+    if words <= 200:
+        return min_points
+    if words >= 1600:
+        return max_points
+
+    span = max_points - min_points
+    if span <= 0:
+        return min_points
+
+    # Add 1 point roughly every ~280 words beyond the first 200.
+    steps = min(span, max(0, (words - 200) // 280))
+    return min_points + int(steps)
+
+
+def _iter_candidate_sentences(text: str) -> List[str]:
+    text = _clean_text(text)
+    if not text:
+        return []
+
+    sentences: List[str] = []
+    for raw_line in re.split(r"\n+", text):
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+
+        # Preserve bullet/numbered list items as units.
+        line = re.sub(r"^\s*([-*•]|\d+[\).])\s+", "", line).strip()
+        if not line:
+            continue
+
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", line) if p.strip()]
+        if not parts:
+            continue
+        sentences.extend(parts)
+
+    out: List[str] = []
+    seen = set()
+    for s in sentences:
+        s = re.sub(r"\s+", " ", s).strip()
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def _token_set(text: str) -> set[str]:
+    return {w.lower() for w in re.findall(r"[A-Za-z0-9']+", text or "") if len(w) >= 3}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if inter == 0:
+        return 0.0
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def generate_summary_points(
+    text: str,
+    *,
+    key_phrases: Optional[Sequence[str]] = None,
+    min_points: int = 5,
+    max_points: int = 10,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Create an extractive bullet-style summary.
+
+    Picks a small set of high-signal sentences from the original text.
+    """
+
+    text = _clean_text(text)
+    if not text:
+        return [], {"target_points": 0, "selected": 0, "mode": "extractive"}
+
+    target = choose_summary_point_count(text, min_points=min_points, max_points=max_points)
+    candidates = _iter_candidate_sentences(text)
+    if not candidates:
+        return [], {"target_points": target, "selected": 0, "mode": "extractive"}
+
+    phrases = [p.strip() for p in (key_phrases or []) if p and p.strip()]
+    if not phrases:
+        phrases = extract_key_phrases(text, top_k=20)
+    phrase_lc = [p.lower() for p in phrases]
+
+    scored: List[Tuple[float, int, str]] = []
+    for idx, sent in enumerate(candidates):
+        sent_lc = sent.lower()
+        hits = sum(1 for p in phrase_lc if p and p in sent_lc)
+
+        word_count = len(re.findall(r"[A-Za-z0-9']+", sent))
+        if word_count < 6:
+            length_bonus = -1.0
+        elif word_count > 40:
+            length_bonus = -0.25
+        else:
+            length_bonus = 0.25
+
+        position_bonus = 0.35 if idx < 3 else (0.15 if idx < 8 else 0.0)
+        score = (hits * 1.0) + length_bonus + position_bonus
+        scored.append((score, idx, sent))
+
+    scored.sort(key=lambda t: (t[0], -t[1]), reverse=True)
+
+    selected: List[Tuple[int, str]] = []
+    selected_sets: List[set[str]] = []
+    for score, idx, sent in scored:
+        if len(selected) >= target:
+            break
+        # Avoid picking very low-signal sentences unless we have no choice.
+        if score < 0.0 and len(selected) >= max(1, target // 2):
+            continue
+
+        tokens = _token_set(sent)
+        if any(_jaccard(tokens, prev) >= 0.82 for prev in selected_sets):
+            continue
+
+        selected.append((idx, sent))
+        selected_sets.append(tokens)
+
+    if not selected:
+        # Fallback: return the first few sentences.
+        selected = list(enumerate(candidates[:target]))
+
+    selected.sort(key=lambda t: t[0])
+    points = [s for _idx, s in selected]
+    return points, {"target_points": target, "selected": len(points), "mode": "extractive"}
 
 
 def _clean_text(text: str) -> str:
@@ -38,40 +191,99 @@ def _clean_text(text: str) -> str:
     return text
 
 
-def _device_to_pipeline_arg(device: str) -> int:
+def _normalize_device(device: str) -> str:
     device = (device or "cpu").strip().lower()
     if device in {"cpu", "-1"}:
-        return -1
+        return "cpu"
     if device in {"cuda", "gpu", "0"}:
-        return 0
+        return "cuda"
     raise ValueError("device must be 'cpu' or 'cuda'")
 
 
-@lru_cache(maxsize=4)
-def _summarization_pipeline(model_name: str, device: str):
-    return pipeline(
-        task="summarization",
-        model=model_name,
-        device=_device_to_pipeline_arg(device),
-    )
+def _auto_batch_size(device: str) -> int:
+    device = _normalize_device(device)
+    return 8 if device == "cuda" else 2
 
 
-@lru_cache(maxsize=4)
-def _intent_pipeline(model_name: str, device: str):
-    return pipeline(
-        task="zero-shot-classification",
-        model=model_name,
-        device=_device_to_pipeline_arg(device),
-    )
+@lru_cache(maxsize=8)
+def _seq2seq_components(model_name: str, device: str):
+    """Load a seq2seq model + tokenizer for summarization/generation."""
+
+    device = _normalize_device(device)
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model.to(torch.device(device))
+    model.eval()
+    return tokenizer, model
 
 
-@lru_cache(maxsize=4)
-def _intent_generation_pipeline(model_name: str, device: str):
-    return pipeline(
-        task="text2text-generation",
-        model=model_name,
-        device=_device_to_pipeline_arg(device),
-    )
+@lru_cache(maxsize=8)
+def _sequence_classifier_components(model_name: str, device: str):
+    """Load a sequence classification model + tokenizer (used for NLI/zero-shot)."""
+
+    device = _normalize_device(device)
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    model.to(torch.device(device))
+    model.eval()
+    return tokenizer, model
+
+
+def _generate_seq2seq_batch(
+    inputs: Sequence[str],
+    *,
+    model_name: str,
+    device: str,
+    max_source_tokens: int | None = None,
+    batch_size: int = 2,
+    generation_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Run seq2seq generation over a list of inputs with batching."""
+
+    tokenizer, model = _seq2seq_components(model_name, device)
+    import torch
+
+    gen_kwargs = dict(generation_kwargs or {})
+
+    outputs: List[str] = []
+    for i in range(0, len(inputs), max(1, int(batch_size))):
+        batch = [b for b in inputs[i : i + batch_size] if (b or "").strip()]
+        if not batch:
+            continue
+
+        enc = tokenizer(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_source_tokens,
+        )
+        enc = {k: v.to(model.device) for k, v in enc.items()}
+
+        with torch.no_grad():
+            try:
+                out_ids = model.generate(**enc, **gen_kwargs)
+            except TypeError:
+                # Backwards compat for older Transformers: translate *new_tokens to *length.
+                compat = dict(gen_kwargs)
+                max_new = compat.pop("max_new_tokens", None)
+                min_new = compat.pop("min_new_tokens", None)
+                if max_new is not None:
+                    compat["max_length"] = int(enc["input_ids"].shape[1] + int(max_new))
+                if min_new is not None:
+                    compat["min_length"] = int(enc["input_ids"].shape[1] + int(min_new))
+                out_ids = model.generate(**enc, **compat)
+
+        decoded = tokenizer.batch_decode(out_ids, skip_special_tokens=True)
+        outputs.extend([(d or "").strip() for d in decoded])
+
+    return outputs
 
 
 @lru_cache(maxsize=16)
@@ -163,28 +375,27 @@ def _chunk_by_tokens(text: str, tokenizer, max_input_tokens: int) -> List[str]:
 
 
 def _summarize_one(
-    summarizer,
     text: str,
-    min_length: int,
-    max_length: int,
+    *,
+    model_name: str,
+    device: str,
+    max_source_tokens: int,
+    min_new_tokens: int,
+    max_new_tokens: int,
 ) -> str:
-    out = summarizer(
-        text,
-        min_length=min_length,
-        max_length=max_length,
-        do_sample=False,
-        truncation=True,
+    out = _generate_seq2seq_batch(
+        [text],
+        model_name=model_name,
+        device=device,
+        max_source_tokens=max_source_tokens,
+        batch_size=1,
+        generation_kwargs={
+            "min_new_tokens": int(min_new_tokens),
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": False,
+        },
     )
-    if not out:
-        return ""
-    return (out[0].get("summary_text") or "").strip()
-
-
-def _auto_batch_size(device: str) -> int:
-    device = (device or "cpu").strip().lower()
-    if device in {"cuda", "gpu", "0"}:
-        return 8
-    return 2
+    return (out[0] if out else "").strip()
 
 
 def summarize_text(
@@ -206,38 +417,25 @@ def summarize_text(
     if not text:
         return "", {"chunks": 0, "model": model_name}
 
-    summarizer = _summarization_pipeline(model_name, device)
-    tokenizer = summarizer.tokenizer
+    device = _normalize_device(device)
+    tokenizer, _model = _seq2seq_components(model_name, device)
 
     chunks = _chunk_by_tokens(text, tokenizer, max_input_tokens=max_input_tokens)
     if not chunks:
         return "", {"chunks": 0, "model": model_name}
 
-    # Speed: run summarization in batch instead of per-chunk calls.
-    try:
-        out = summarizer(
-            chunks,
-            min_length=min_length,
-            max_length=max_length,
-            do_sample=False,
-            truncation=True,
-            batch_size=min(len(chunks), _auto_batch_size(device)),
-        )
-    except TypeError:
-        out = summarizer(
-            chunks,
-            min_length=min_length,
-            max_length=max_length,
-            do_sample=False,
-            truncation=True,
-        )
-
-    if isinstance(out, list):
-        chunk_summaries = [
-            (o.get("summary_text") or "").strip() for o in out if isinstance(o, dict)
-        ]
-    else:
-        chunk_summaries = []
+    chunk_summaries = _generate_seq2seq_batch(
+        chunks,
+        model_name=model_name,
+        device=device,
+        max_source_tokens=max_input_tokens,
+        batch_size=min(len(chunks), _auto_batch_size(device)),
+        generation_kwargs={
+            "min_new_tokens": int(min_length),
+            "max_new_tokens": int(max_length),
+            "do_sample": False,
+        },
+    )
     chunk_summaries = [s for s in chunk_summaries if s]
 
     if not chunk_summaries:
@@ -257,10 +455,12 @@ def summarize_text(
 
     combined = "\n".join(chunk_summaries)
     final = _summarize_one(
-        summarizer,
         combined,
-        min_length=max(20, min_length // 2),
-        max_length=max(60, max_length),
+        model_name=model_name,
+        device=device,
+        max_source_tokens=max_input_tokens,
+        min_new_tokens=max(10, int(min_length) // 2),
+        max_new_tokens=max(60, int(max_length)),
     )
 
     return final or "\n".join(chunk_summaries), {
@@ -310,13 +510,51 @@ def detect_intent(
     if not text or not labels:
         return None, [], {"model": model_name}
 
-    classifier = _intent_pipeline(model_name, device)
-    res = classifier(text, labels, multi_label=False, truncation=True)
+    device = _normalize_device(device)
+    tokenizer, model = _sequence_classifier_components(model_name, device)
+    import torch
 
-    ranked = list(zip(res.get("labels", []), res.get("scores", [])))
+    # NLI-style zero-shot: premise is the text, hypothesis is label statement.
+    premises = [text] * len(labels)
+    hypotheses = [f"This text is about {lbl}." for lbl in labels]
+    enc = tokenizer(
+        premises,
+        hypotheses,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512,
+    )
+    enc = {k: v.to(model.device) for k, v in enc.items()}
+
+    with torch.no_grad():
+        logits = model(**enc).logits
+        probs = torch.softmax(logits, dim=-1)
+
+    # Try to locate the entailment label id, else fall back to common MNLI convention.
+    cfg = getattr(model, "config", None)
+    entailment_id: int | None = None
+    if cfg is not None:
+        label2id = {str(k).lower(): int(v) for k, v in (getattr(cfg, "label2id", {}) or {}).items()}
+        if "entailment" in label2id:
+            entailment_id = label2id["entailment"]
+        else:
+            id2label = {int(k): str(v).lower() for k, v in (getattr(cfg, "id2label", {}) or {}).items()}
+            for idx, name in id2label.items():
+                if "entailment" in name:
+                    entailment_id = int(idx)
+                    break
+            if entailment_id is None and int(getattr(cfg, "num_labels", 0) or 0) == 3:
+                entailment_id = 2
+
+    if entailment_id is None:
+        entailment_id = min(2, probs.shape[-1] - 1)
+
+    scores = probs[:, int(entailment_id)].detach().cpu().tolist()
+    ranked = sorted(zip(labels, scores), key=lambda t: t[1], reverse=True)
     preds = [IntentPrediction(label=l, score=float(s)) for l, s in ranked[: max(1, top_k)]]
     top = preds[0] if preds else None
-    return top, preds, {"model": model_name}
+    return top, preds, {"model": model_name, "mode": "nli"}
 
 
 def generate_intent(
@@ -332,7 +570,7 @@ def generate_intent(
     if not text:
         return None, {"model": model_name}
 
-    generator = _intent_generation_pipeline(model_name, device)
+    device = _normalize_device(device)
 
     text_snippet = text[:2000]
     prompt = (
@@ -341,15 +579,20 @@ def generate_intent(
         f"Text:\n{text_snippet}\n\nIntent:"
     )
 
-    out = generator(
-        prompt,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        truncation=True,
+    out = _generate_seq2seq_batch(
+        [prompt],
+        model_name=model_name,
+        device=device,
+        max_source_tokens=512,
+        batch_size=1,
+        generation_kwargs={
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": False,
+            "num_beams": 4,
+            "early_stopping": True,
+        },
     )
-    generated = ""
-    if isinstance(out, list) and out and isinstance(out[0], dict):
-        generated = (out[0].get("generated_text") or "").strip()
+    generated = (out[0] if out else "").strip()
 
     generated = generated.strip().strip('"').strip("'")
     generated = re.sub(r"\s+", " ", generated)
@@ -437,7 +680,7 @@ def generate_synopsis_and_keyphrases(
     if not text and not base_summary:
         return "", [], {"model": model_name}
 
-    generator = _intent_generation_pipeline(model_name, device)
+    device = _normalize_device(device)
     requested_k = int(top_k or 0)
     requested_k = max(0, min(requested_k, 20))
 
@@ -486,19 +729,23 @@ def generate_synopsis_and_keyphrases(
 
     def _generate(prompt_text: str, *, strict: bool) -> str:
         params: Dict[str, Any] = {
-            "max_new_tokens": max_new_tokens,
+            "max_new_tokens": int(max_new_tokens),
             "do_sample": False,
-            "truncation": True,
             "num_beams": 4,
             "early_stopping": True,
             "no_repeat_ngram_size": 4 if not strict else 6,
             "repetition_penalty": 1.15 if not strict else 1.25,
             "length_penalty": 1.0,
         }
-        out_local = generator(prompt_text, **params)
-        if isinstance(out_local, list) and out_local and isinstance(out_local[0], dict):
-            return (out_local[0].get("generated_text") or "").strip()
-        return ""
+        out_local = _generate_seq2seq_batch(
+            [prompt_text],
+            model_name=model_name,
+            device=device,
+            max_source_tokens=1024,
+            batch_size=1,
+            generation_kwargs=params,
+        )
+        return (out_local[0] if out_local else "").strip()
 
     generated = _generate(prompt, strict=False)
     synopsis, keyphrases = _parse_synopsis_and_keyphrases(generated)
@@ -594,13 +841,22 @@ def analyze_text(
     else:
         intent_top, intent_topk, intent_meta = None, [], {"model": intent_model, "skipped": True}
 
+    summary_points, points_meta = generate_summary_points(
+        text,
+        key_phrases=key_phrases,
+        min_points=5,
+        max_points=10,
+    )
+
     return AnalysisResult(
         summary=summary,
+        summary_points=summary_points,
         key_phrases=key_phrases,
         intent_top=intent_top,
         intent_top_k=intent_topk,
         meta={
             "summary": sum_meta,
+            "summary_points": points_meta,
             "intent": intent_meta,
             "device": device,
             "chars": len(text),

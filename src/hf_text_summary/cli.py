@@ -70,7 +70,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print("SUMMARY\n------")
-    print(result.summary)
+    if getattr(result, "summary_points", None):
+        for p in result.summary_points:
+            print(f"- {p}")
+    else:
+        print(result.summary)
     print("\nKEY PHRASES\n----------")
     for p in result.key_phrases:
         print(f"- {p}")

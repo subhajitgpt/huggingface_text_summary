@@ -163,10 +163,13 @@ if run:
     tab_synopsis, tab_meta = st.tabs(["Synopsis", "Metadata"])
 
     with tab_synopsis:
-        if result.summary:
+        if result.summary or getattr(result, "summary_points", None):
             with st.container(border=True):
                 st.subheader("Synopsis")
-                st.markdown(f"**{result.summary}**")
+                if getattr(result, "summary_points", None):
+                    st.markdown("\n".join([f"- {p}" for p in result.summary_points]))
+                else:
+                    st.markdown(f"**{result.summary}**")
 
                 st.divider()
                 st.subheader("Intent")
