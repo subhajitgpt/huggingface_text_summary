@@ -8,6 +8,15 @@ from typing import List
 import streamlit as st
 
 
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 def _running_in_streamlit() -> bool:
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -72,9 +81,16 @@ with st.sidebar:
         )
 
     with st.expander("Runtime", expanded=True):
+        device_options = ["cpu"] + (["cuda"] if _cuda_available() else [])
+
+        # If a previous run stored 'cuda' in session state on a non-CUDA host,
+        # Streamlit will try to restore it. Force it back to 'cpu'.
+        if st.session_state.get("Device") == "cuda" and "cuda" not in device_options:
+            st.session_state["Device"] = "cpu"
+
         device = st.selectbox(
             "Device",
-            options=["cpu", "cuda"],
+            options=device_options,
             index=0,
             help="Use 'cuda' only if a GPU + CUDA Torch is available.",
         )
@@ -141,6 +157,10 @@ if run:
     if summary_max <= summary_min:
         st.warning("Summary max length must be greater than min length.")
         st.stop()
+
+    if device == "cuda" and not _cuda_available():
+        st.warning("CUDA is not available on this host. Falling back to CPU.")
+        device = "cpu"
 
     with st.spinner("Running models..."):
         result = analyze_text(

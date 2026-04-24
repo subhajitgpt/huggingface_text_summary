@@ -196,7 +196,12 @@ def _normalize_device(device: str) -> str:
     if device in {"cpu", "-1"}:
         return "cpu"
     if device in {"cuda", "gpu", "0"}:
-        return "cuda"
+        try:
+            import torch
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
     raise ValueError("device must be 'cpu' or 'cuda'")
 
 
